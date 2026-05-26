@@ -1,0 +1,211 @@
+"""
+attendance_manager.py - Module quản lý điểm danh
+"""
+import os
+import csv
+import time
+from datetime import datetime, date
+import pandas as pd
+import config
+
+
+class AttendanceManager:
+    """
+    Quản lý toàn bộ logic điểm danh:
+    - Ghi nhận điểm danh vào CSV
+    - Tránh điểm danh trùng trong ngày
+    - Xuất báo cáo Excel
+    """
+
+    def __init__(self):
+        self._attendance_today = {}   # {name: datetime} - cache điểm danh hôm nay
+        self._today_str = self._get_today_str()
+        self._csv_path = self._get_csv_path()
+        self._load_existing_attendance()
+
+    # ─────────────────────────────────────────────
+    # PUBLIC API
+    # ─────────────────────────────────────────────
+
+    def mark_attendance(self, name):
+        """
+        Ghi điểm danh cho một người.
+
+        Returns:
+            dict: {"success": bool, "message": str, "is_new": bool}
+        """
+        if name == "Unknown" or not name:
+            return {"success": False, "message": "Không nhận diện được", "is_new": False}
+
+        now = datetime.now()
+        today = self._get_today_str()
+
+        # Reset nếu sang ngày mới
+        if today != self._today_str:
+            self._today_str = today
+            self._csv_path = self._get_csv_path()
+            self._attendance_today = {}
+
+        # Kiểm tra cooldown
+        if name in self._attendance_today:
+            last_time = self._attendance_today[name]
+            elapsed = (now - last_time).total_seconds()
+            if elapsed < config.ATTENDANCE_COOLDOWN:
+                remaining = int(config.ATTENDANCE_COOLDOWN - elapsed)
+                display = name.replace("_", " ").title()
+                return {
+                    "success": True,
+                    "message": f"{display} đã điểm danh ({remaining}s còn lại)",
+                    "is_new": False,
+                }
+
+        # Ghi vào CSV
+        self._write_csv_row(name, now)
+        self._attendance_today[name] = now
+
+        display = name.replace("_", " ").title()
+        return {
+            "success": True,
+            "message": f"✓ Điểm danh thành công: {display}",
+            "is_new": True,
+        }
+
+    def get_today_attendance(self):
+        """
+        Lấy danh sách điểm danh hôm nay từ CSV.
+
+        Returns:
+            list of dict: [{"stt", "name", "display_name", "date", "time", "status"}]
+        """
+        today = self._get_today_str()
+        if today != self._today_str:
+            self._today_str = today
+            self._csv_path = self._get_csv_path()
+
+        records = []
+        if not os.path.exists(self._csv_path):
+            return records
+
+        try:
+            with open(self._csv_path, newline="", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for i, row in enumerate(reader, 1):
+                    records.append({
+                        "stt": i,
+                        "name": row.get("Tên", ""),
+                        "display_name": row.get("Tên", "").replace("_", " ").title(),
+                        "date": row.get("Ngày", ""),
+                        "time": row.get("Giờ vào", ""),
+                        "status": row.get("Trạng thái", "Có mặt"),
+                    })
+        except Exception as e:
+            print(f"[ERROR] Lỗi đọc CSV: {e}")
+
+        return records
+
+    def get_attendance_stats(self):
+        """Thống kê điểm danh hôm nay."""
+        records = self.get_today_attendance()
+        return {
+            "total": len(records),
+            "date": self._get_today_str(),
+            "records": records,
+        }
+
+    def export_to_excel(self, target_date=None):
+        """
+        Xuất dữ liệu điểm danh ra file Excel.
+
+        Args:
+            target_date: Ngày cần xuất (str YYYY-MM-DD), mặc định = hôm nay
+
+        Returns:
+            str: Đường dẫn file Excel đã xuất, hoặc None nếu lỗi
+        """
+        if target_date is None:
+            target_date = self._get_today_str()
+
+        csv_path = self._get_csv_path(target_date)
+        if not os.path.exists(csv_path):
+            return None
+
+        try:
+            df = pd.read_csv(csv_path, encoding="utf-8-sig")
+
+            # Định dạng tên hiển thị
+            if "Tên" in df.columns:
+                df["Tên"] = df["Tên"].str.replace("_", " ").str.title()
+
+            excel_filename = config.EXCEL_FILENAME_FORMAT.format(date=target_date)
+            excel_path = os.path.join(config.ATTENDANCE_DIR, excel_filename)
+
+            with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Điểm Danh")
+
+                # Định dạng cột rộng
+                ws = writer.sheets["Điểm Danh"]
+                for col in ws.columns:
+                    max_len = max(len(str(cell.value or "")) for cell in col)
+                    ws.column_dimensions[col[0].column_letter].width = max_len + 4
+
+            print(f"[INFO] Đã xuất Excel: {excel_path}")
+            return excel_path
+
+        except Exception as e:
+            print(f"[ERROR] Lỗi xuất Excel: {e}")
+            return None
+
+    def get_all_csv_files(self):
+        """Lấy danh sách tất cả file CSV điểm danh."""
+        files = []
+        for f in os.listdir(config.ATTENDANCE_DIR):
+            if f.endswith(".csv"):
+                full_path = os.path.join(config.ATTENDANCE_DIR, f)
+                files.append({
+                    "filename": f,
+                    "path": full_path,
+                    "date": f.replace("attendance_", "").replace(".csv", ""),
+                })
+        return sorted(files, key=lambda x: x["date"], reverse=True)
+
+    # ─────────────────────────────────────────────
+    # PRIVATE HELPERS
+    # ─────────────────────────────────────────────
+
+    def _get_today_str(self):
+        return date.today().strftime("%Y-%m-%d")
+
+    def _get_csv_path(self, date_str=None):
+        if date_str is None:
+            date_str = self._get_today_str()
+        filename = config.CSV_FILENAME_FORMAT.format(date=date_str)
+        return os.path.join(config.ATTENDANCE_DIR, filename)
+
+    def _write_csv_row(self, name, dt):
+        """Ghi một dòng dữ liệu vào file CSV."""
+        file_exists = os.path.exists(self._csv_path)
+        with open(self._csv_path, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(config.CSV_COLUMNS)
+            # Đếm dòng hiện có để tạo STT
+            stt = sum(1 for _ in open(self._csv_path, encoding="utf-8-sig")) - 1
+            writer.writerow([
+                stt,
+                name,
+                dt.strftime("%Y-%m-%d"),
+                dt.strftime("%H:%M:%S"),
+                "Có mặt",
+            ])
+
+    def _load_existing_attendance(self):
+        """Tải điểm danh hiện tại trong ngày vào cache."""
+        records = self.get_today_attendance()
+        for r in records:
+            try:
+                dt = datetime.strptime(
+                    f"{r['date']} {r['time']}", "%Y-%m-%d %H:%M:%S"
+                )
+                self._attendance_today[r["name"]] = dt
+            except Exception:
+                pass
