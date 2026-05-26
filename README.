@@ -1,0 +1,133 @@
+# 👤 Hệ thống Điểm danh Nhận diện Khuôn mặt
+
+Ứng dụng web tự động điểm danh bằng AI nhận diện khuôn mặt, xây dựng với Streamlit + face_recognition + OpenCV.
+
+---
+
+## ⚡ Cài đặt nhanh
+
+### Bước 1: Yêu cầu hệ thống
+
+Trước tiên cài các thư viện C cần thiết cho `face_recognition`:
+
+**macOS:**
+```bash
+brew install cmake
+brew install dlib
+```
+
+**Ubuntu / Debian:**
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake libopenblas-dev liblapack-dev libx11-dev
+```
+
+**Windows:**
+- Cài [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/)
+- Cài [CMake](https://cmake.org/download/)
+
+### Bước 2: Tạo môi trường và cài thư viện
+
+```bash
+# Tạo virtual environment (khuyến nghị)
+python -m venv venv
+
+# Kích hoạt
+# macOS/Linux:
+source venv/bin/activate
+# Windows:
+venv\Scripts\activate
+
+# Cài thư viện
+pip install -r requirements.txt
+```
+
+> ⚠️ `face-recognition` phụ thuộc vào `dlib` — có thể mất 5–10 phút để build.
+
+### Bước 3: Chạy ứng dụng
+
+```bash
+streamlit run app.py
+```
+
+Mở trình duyệt tại: **http://localhost:8501**
+
+---
+
+## 📁 Cấu trúc thư mục
+
+```
+face_attendance/
+├── app.py                  # Ứng dụng chính
+├── requirements.txt        # Thư viện cần cài
+├── encodings.pkl           # Database khuôn mặt (tự tạo sau khi train)
+├── known_faces/            # Ảnh khuôn mặt (thêm vào đây)
+│   ├── nguyen_van_a/
+│   │   ├── anh1.jpg
+│   │   └── anh2.jpg
+│   └── tran_thi_b/
+│       └── anh1.jpg
+└── attendance_data/
+    ├── attendance.csv      # Dữ liệu điểm danh (CSV)
+    └── attendance.xlsx     # Dữ liệu điểm danh (Excel)
+```
+
+---
+
+## 🚀 Hướng dẫn sử dụng
+
+### 1. Thêm người vào database
+
+**Cách A — Qua giao diện web:**
+- Vào trang **Quản lý khuôn mặt** → tab **Thêm người mới**
+- Nhập tên (vd: `nguyen_van_a`) và tải ảnh lên
+
+**Cách B — Thủ công:**
+- Tạo thư mục con trong `known_faces/` với tên người (dùng gạch dưới thay dấu cách)
+- Đặt 1–5 ảnh JPG/PNG vào trong
+
+### 2. Train model
+
+- Vào **Quản lý khuôn mặt** → tab **Train model** → nhấn **Bắt đầu Train**
+- Làm lại bước này mỗi khi thêm/xóa người
+
+### 3. Điểm danh
+
+- **Camera trực tiếp:** trang **Nhận diện Camera** → bật toggle → hướng camera vào mặt
+- **Từ ảnh:** trang **Nhận diện từ Ảnh** → tải ảnh lên
+
+### 4. Xem báo cáo
+
+- Vào trang **Báo cáo điểm danh**
+- Lọc theo ngày / tên
+- Tải xuống CSV hoặc Excel
+
+---
+
+## ⚙️ Tuỳ chỉnh
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `tolerance` | `0.52` | Ngưỡng nhận diện (0.3–0.7). Thấp hơn = chặt hơn |
+| Số ảnh/người | 1–5 | Nhiều ảnh hơn → chính xác hơn |
+| Độ phân giải | 50% | Resize frame trước khi xử lý để tăng tốc |
+
+---
+
+## 💡 Mẹo để nhận diện tốt hơn
+
+- Chụp ảnh trong điều kiện ánh sáng tốt, khuôn mặt rõ nét
+- Dùng 3–5 ảnh mỗi người với các góc và biểu cảm khác nhau
+- Khuôn mặt chiếm ít nhất 30% diện tích ảnh
+- Tránh ảnh bị mờ hoặc ngược sáng
+
+---
+
+## 🛠️ Xử lý lỗi thường gặp
+
+| Lỗi | Giải pháp |
+|-----|-----------|
+| `dlib build error` | Cài cmake và build tools (xem Bước 1) |
+| Camera không mở được | Kiểm tra quyền camera trong System Settings |
+| Nhận diện sai | Tăng số ảnh train, giảm tolerance |
+| App chạy chậm | Giảm độ phân giải camera hoặc tăng `sleep` delay |
