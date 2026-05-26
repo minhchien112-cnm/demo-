@@ -1,0 +1,681 @@
+"""
+gui_app.py - Giao diện GUI chính với Tkinter (Dark Mode)
+"""
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import threading
+import time
+import queue
+import cv2
+from PIL import Image, ImageTk
+import config
+from face_encoder import load_known_faces, load_encodings, save_encodings, get_known_faces_info
+from face_recognizer import recognize_faces, draw_face_boxes, add_overlay_info
+from attendance_manager import AttendanceManager
+
+
+class FaceAttendanceApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(config.APP_TITLE)
+        self.root.geometry(config.WINDOW_SIZE)
+        self.root.configure(bg=config.COLORS["bg_dark"])
+        self.root.resizable(True, True)
+        self.root.minsize(1000, 620)
+
+        # ── State ──────────────────────────────────────
+        self.camera_running = False
+        self.cap = None
+        self.frame_queue = queue.Queue(maxsize=2)
+        self.result_queue = queue.Queue(maxsize=10)
+        self.known_encodings = []
+        self.known_names = []
+        self.attendance_mgr = AttendanceManager()
+        self.frame_count = 0
+        self.fps = 0.0
+        self.fps_start = time.time()
+        self.flash_active = False
+
+        # ── Build UI ───────────────────────────────────
+        self._setup_styles()
+        self._build_header()
+        self._build_main_content()
+        self._build_statusbar()
+
+        # ── Load encodings ─────────────────────────────
+        self._load_face_data()
+
+        # ── Auto-refresh attendance table ──────────────
+        self._refresh_attendance_table()
+        self._start_result_consumer()
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ══════════════════════════════════════════════════
+    #  SETUP STYLES
+    # ══════════════════════════════════════════════════
+    def _setup_styles(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        bg = config.COLORS["bg_dark"]
+        card = config.COLORS["bg_card"]
+        accent = config.COLORS["accent_blue"]
+        text = config.COLORS["text_primary"]
+        border = config.COLORS["border"]
+        secondary = config.COLORS["text_secondary"]
+
+        style.configure(".", background=bg, foreground=text,
+                        font=config.FONTS["body"])
+
+        # Treeview (bảng điểm danh)
+        style.configure("Attendance.Treeview",
+                        background=card, foreground=text,
+                        fieldbackground=card, rowheight=32,
+                        borderwidth=0, relief="flat",
+                        font=config.FONTS["body"])
+        style.configure("Attendance.Treeview.Heading",
+                        background=config.COLORS["bg_hover"],
+                        foreground=secondary,
+                        font=config.FONTS["body_bold"],
+                        borderwidth=0, relief="flat")
+        style.map("Attendance.Treeview",
+                  background=[("selected", accent)],
+                  foreground=[("selected", "white")])
+
+        # Scrollbar
+        style.configure("Dark.Vertical.TScrollbar",
+                        background=config.COLORS["bg_hover"],
+                        troughcolor=card, borderwidth=0,
+                        arrowcolor=secondary)
+
+    # ══════════════════════════════════════════════════
+    #  HEADER
+    # ══════════════════════════════════════════════════
+    def _build_header(self):
+        header = tk.Frame(self.root, bg=config.COLORS["bg_card"],
+                          height=64, bd=0)
+        header.pack(fill=tk.X, side=tk.TOP)
+        header.pack_propagate(False)
+
+        # Logo + title
+        title_frame = tk.Frame(header, bg=config.COLORS["bg_card"])
+        title_frame.pack(side=tk.LEFT, padx=20, pady=12)
+
+        tk.Label(title_frame, text="🎓", font=("Segoe UI Emoji", 20),
+                 bg=config.COLORS["bg_card"],
+                 fg=config.COLORS["accent_blue"]).pack(side=tk.LEFT)
+
+        tk.Label(title_frame, text="  Hệ Thống Điểm Danh",
+                 font=config.FONTS["title"],
+                 bg=config.COLORS["bg_card"],
+                 fg=config.COLORS["text_primary"]).pack(side=tk.LEFT)
+
+        tk.Label(title_frame, text=" Nhận Diện Khuôn Mặt",
+                 font=("Segoe UI", 18),
+                 bg=config.COLORS["bg_card"],
+                 fg=config.COLORS["accent_blue"]).pack(side=tk.LEFT)
+
+        # Datetime label
+        self.datetime_label = tk.Label(
+            header, text="", font=config.FONTS["body"],
+            bg=config.COLORS["bg_card"],
+            fg=config.COLORS["text_secondary"]
+        )
+        self.datetime_label.pack(side=tk.RIGHT, padx=20)
+        self._update_datetime()
+
+        # Separator
+        sep = tk.Frame(self.root, bg=config.COLORS["border"], height=1)
+        sep.pack(fill=tk.X)
+
+    # ══════════════════════════════════════════════════
+    #  MAIN CONTENT
+    # ══════════════════════════════════════════════════
+    def _build_main_content(self):
+        main = tk.Frame(self.root, bg=config.COLORS["bg_dark"])
+        main.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
+
+        # Left: Camera
+        self._build_camera_panel(main)
+        # Right: Controls + Attendance
+        self._build_right_panel(main)
+
+    # ── Camera Panel ──────────────────────────────────
+    def _build_camera_panel(self, parent):
+        left = tk.Frame(parent, bg=config.COLORS["bg_dark"])
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+
+        # Card container
+        cam_card = tk.Frame(left, bg=config.COLORS["bg_card"],
+                            bd=0, relief="flat")
+        cam_card.pack(fill=tk.BOTH, expand=True)
+        self._add_card_border(cam_card)
+
+        # Title
+        cam_title = tk.Frame(cam_card, bg=config.COLORS["bg_card"])
+        cam_title.pack(fill=tk.X, padx=16, pady=(12, 8))
+        tk.Label(cam_title, text="📷  Camera Feed",
+                 font=config.FONTS["heading"],
+                 bg=config.COLORS["bg_card"],
+                 fg=config.COLORS["text_primary"]).pack(side=tk.LEFT)
+
+        self.cam_status_dot = tk.Label(cam_title, text="●",
+                                       font=("Segoe UI", 12),
+                                       bg=config.COLORS["bg_card"],
+                                       fg=config.COLORS["text_muted"])
+        self.cam_status_dot.pack(side=tk.RIGHT)
+
+        # Camera display
+        cam_frame = tk.Frame(cam_card, bg="#000000",
+                             width=config.CAMERA_WIDTH,
+                             height=config.CAMERA_HEIGHT)
+        cam_frame.pack(padx=12, pady=(0, 8))
+        cam_frame.pack_propagate(False)
+
+        self.camera_label = tk.Label(
+            cam_frame, bg="#000000",
+            text="Camera chưa được bật\n\nNhấn 'Bật Camera' để bắt đầu",
+            font=config.FONTS["heading"],
+            fg=config.COLORS["text_muted"],
+            justify=tk.CENTER
+        )
+        self.camera_label.pack(fill=tk.BOTH, expand=True)
+
+        # Camera buttons
+        btn_row = tk.Frame(cam_card, bg=config.COLORS["bg_card"])
+        btn_row.pack(fill=tk.X, padx=12, pady=(0, 12))
+
+        self.toggle_cam_btn = self._make_button(
+            btn_row, "▶  Bật Camera",
+            config.COLORS["accent_green"],
+            self._toggle_camera, width=16
+        )
+        self.toggle_cam_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self._make_button(
+            btn_row, "🔄  Tải lại khuôn mặt",
+            config.COLORS["accent_blue"],
+            self._reload_faces, width=20
+        ).pack(side=tk.LEFT)
+
+    # ── Right Panel ───────────────────────────────────
+    def _build_right_panel(self, parent):
+        right = tk.Frame(parent, bg=config.COLORS["bg_dark"], width=420)
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(8, 0))
+        right.pack_propagate(False)
+
+        # Stats cards
+        self._build_stats_cards(right)
+
+        # Attendance table
+        self._build_attendance_table(right)
+
+        # Export button
+        self._build_export_section(right)
+
+    def _build_stats_cards(self, parent):
+        stats_frame = tk.Frame(parent, bg=config.COLORS["bg_dark"])
+        stats_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # Card: Số người điểm danh
+        card1 = self._make_stat_card(stats_frame,
+                                     "👥 Đã điểm danh", "0",
+                                     config.COLORS["accent_blue"])
+        card1.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+        self.stat_total_label = card1.winfo_children()[1]
+
+        # Card: Số khuôn mặt DB
+        card2 = self._make_stat_card(stats_frame,
+                                     "🧠 Khuôn mặt DB", "0",
+                                     config.COLORS["accent_purple"])
+        card2.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.stat_db_label = card2.winfo_children()[1]
+        self._update_db_count()
+
+    def _make_stat_card(self, parent, title, value, color):
+        card = tk.Frame(parent, bg=config.COLORS["bg_card"], padx=14, pady=10)
+        self._add_card_border(card)
+
+        tk.Label(card, text=title, font=config.FONTS["small"],
+                 bg=config.COLORS["bg_card"],
+                 fg=config.COLORS["text_secondary"]).pack(anchor=tk.W)
+
+        val_label = tk.Label(card, text=value,
+                             font=("Segoe UI", 28, "bold"),
+                             bg=config.COLORS["bg_card"], fg=color)
+        val_label.pack(anchor=tk.W)
+
+        return card
+
+    def _build_attendance_table(self, parent):
+        table_card = tk.Frame(parent, bg=config.COLORS["bg_card"])
+        table_card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        self._add_card_border(table_card)
+
+        # Header
+        t_header = tk.Frame(table_card, bg=config.COLORS["bg_card"])
+        t_header.pack(fill=tk.X, padx=14, pady=(12, 8))
+
+        tk.Label(t_header, text="📋  Danh sách điểm danh hôm nay",
+                 font=config.FONTS["heading"],
+                 bg=config.COLORS["bg_card"],
+                 fg=config.COLORS["text_primary"]).pack(side=tk.LEFT)
+
+        refresh_btn = tk.Label(t_header, text="↻",
+                               font=("Segoe UI", 14),
+                               bg=config.COLORS["bg_card"],
+                               fg=config.COLORS["accent_blue"],
+                               cursor="hand2")
+        refresh_btn.pack(side=tk.RIGHT)
+        refresh_btn.bind("<Button-1>", lambda e: self._refresh_attendance_table())
+
+        # Treeview
+        tree_frame = tk.Frame(table_card, bg=config.COLORS["bg_card"])
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        columns = ("STT", "Tên", "Giờ vào", "Trạng thái")
+        self.tree = ttk.Treeview(tree_frame, columns=columns,
+                                 show="headings", style="Attendance.Treeview")
+
+        widths = {"STT": 40, "Tên": 140, "Giờ vào": 90, "Trạng thái": 90}
+        for col in columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=widths[col],
+                             anchor=tk.CENTER if col == "STT" else tk.W)
+
+        # Tags màu cho dòng chẵn/lẻ
+        self.tree.tag_configure("odd", background=config.COLORS["bg_card"])
+        self.tree.tag_configure("even", background=config.COLORS["bg_hover"])
+        self.tree.tag_configure("new", background=config.COLORS["success_bg"],
+                                foreground=config.COLORS["accent_green"])
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL,
+                                  command=self.tree.yview,
+                                  style="Dark.Vertical.TScrollbar")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _build_export_section(self, parent):
+        export_card = tk.Frame(parent, bg=config.COLORS["bg_card"],
+                               padx=14, pady=12)
+        export_card.pack(fill=tk.X)
+        self._add_card_border(export_card)
+
+        tk.Label(export_card, text="📁  Xuất dữ liệu",
+                 font=config.FONTS["heading"],
+                 bg=config.COLORS["bg_card"],
+                 fg=config.COLORS["text_primary"]).pack(anchor=tk.W, pady=(0, 8))
+
+        btn_row = tk.Frame(export_card, bg=config.COLORS["bg_card"])
+        btn_row.pack(fill=tk.X)
+
+        self._make_button(
+            btn_row, "📊 Xuất Excel",
+            config.COLORS["accent_green"],
+            self._export_excel, width=14
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self._make_button(
+            btn_row, "📂 Mở thư mục",
+            config.COLORS["bg_hover"],
+            self._open_attendance_folder, width=14
+        ).pack(side=tk.LEFT)
+
+    # ══════════════════════════════════════════════════
+    #  STATUS BAR
+    # ══════════════════════════════════════════════════
+    def _build_statusbar(self):
+        sep = tk.Frame(self.root, bg=config.COLORS["border"], height=1)
+        sep.pack(fill=tk.X, side=tk.BOTTOM)
+
+        bar = tk.Frame(self.root, bg=config.COLORS["bg_card"],
+                       height=28)
+        bar.pack(fill=tk.X, side=tk.BOTTOM)
+        bar.pack_propagate(False)
+
+        self.status_label = tk.Label(
+            bar, text="🟢 Sẵn sàng",
+            font=config.FONTS["status"],
+            bg=config.COLORS["bg_card"],
+            fg=config.COLORS["text_secondary"]
+        )
+        self.status_label.pack(side=tk.LEFT, padx=14)
+
+        self.fps_label = tk.Label(
+            bar, text="FPS: —",
+            font=config.FONTS["status"],
+            bg=config.COLORS["bg_card"],
+            fg=config.COLORS["text_muted"]
+        )
+        self.fps_label.pack(side=tk.RIGHT, padx=14)
+
+    # ══════════════════════════════════════════════════
+    #  CAMERA LOGIC
+    # ══════════════════════════════════════════════════
+    def _toggle_camera(self):
+        if self.camera_running:
+            self._stop_camera()
+        else:
+            self._start_camera()
+
+    def _start_camera(self):
+        self.cap = cv2.VideoCapture(config.CAMERA_INDEX)
+        if not self.cap.isOpened():
+            messagebox.showerror("Lỗi", "Không thể mở camera!\nKiểm tra lại thiết bị.")
+            return
+
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.camera_running = True
+        self.toggle_cam_btn.config(
+            text="⏹  Tắt Camera",
+            bg=config.COLORS["accent_red"]
+        )
+        self.cam_status_dot.config(fg=config.COLORS["accent_green"])
+        self._set_status("🎥 Camera đang chạy...")
+
+        # Thread nhận frame từ camera
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop, daemon=True
+        )
+        self._capture_thread.start()
+
+        # Thread nhận diện khuôn mặt
+        self._recog_thread = threading.Thread(
+            target=self._recognition_loop, daemon=True
+        )
+        self._recog_thread.start()
+
+        self._update_camera_display()
+
+    def _stop_camera(self):
+        self.camera_running = False
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+        self.camera_label.config(
+            image="",
+            text="Camera đã tắt\n\nNhấn 'Bật Camera' để bắt đầu lại",
+            font=config.FONTS["heading"],
+            fg=config.COLORS["text_muted"]
+        )
+        self.toggle_cam_btn.config(
+            text="▶  Bật Camera",
+            bg=config.COLORS["accent_green"]
+        )
+        self.cam_status_dot.config(fg=config.COLORS["text_muted"])
+        self._set_status("⏹ Camera đã tắt")
+        self.fps_label.config(text="FPS: —")
+
+    def _capture_loop(self):
+        """Thread đọc frame từ camera."""
+        while self.camera_running:
+            if self.cap is None:
+                break
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            frame = cv2.flip(frame, 1)  # Mirror effect
+            if not self.frame_queue.full():
+                self.frame_queue.put(frame)
+        print("[INFO] Capture loop kết thúc.")
+
+    def _recognition_loop(self):
+        """Thread nhận diện khuôn mặt (chạy nền)."""
+        interval = config.RECOGNITION_INTERVAL
+        local_count = 0
+        while self.camera_running:
+            try:
+                frame = self.frame_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            local_count += 1
+            if local_count % interval != 0:
+                continue
+
+            results = recognize_faces(frame, self.known_encodings, self.known_names)
+
+            for r in results:
+                if r["name"] != "Unknown":
+                    att_result = self.attendance_mgr.mark_attendance(r["name"])
+                    if att_result["is_new"]:
+                        self.result_queue.put({
+                            "type": "new_attendance",
+                            "name": r["name"],
+                            "message": att_result["message"],
+                        })
+
+            if not self.result_queue.full():
+                self.result_queue.put({"type": "frame_result", "results": results})
+
+    def _update_camera_display(self):
+        """Cập nhật hiển thị camera (chạy trên main thread)."""
+        if not self.camera_running:
+            return
+
+        try:
+            frame = self.frame_queue.get_nowait()
+
+            # Tính FPS
+            self.frame_count += 1
+            elapsed = time.time() - self.fps_start
+            if elapsed >= 1.0:
+                self.fps = self.frame_count / elapsed
+                self.frame_count = 0
+                self.fps_start = time.time()
+                self.fps_label.config(text=f"FPS: {self.fps:.1f}")
+
+            # Vẽ kết quả nhận diện nếu có
+            if hasattr(self, "_last_recognition_results"):
+                frame = draw_face_boxes(frame, self._last_recognition_results)
+                frame = add_overlay_info(frame, self.fps,
+                                        len(self._last_recognition_results))
+
+            # Resize để fit panel
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            cam_w = self.camera_label.winfo_width() or config.CAMERA_WIDTH
+            cam_h = self.camera_label.winfo_height() or config.CAMERA_HEIGHT
+            img = Image.fromarray(frame_rgb)
+            img.thumbnail((cam_w, cam_h), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self.camera_label.config(image=photo, text="")
+            self.camera_label.image = photo
+
+        except queue.Empty:
+            pass
+
+        self.root.after(33, self._update_camera_display)  # ~30 FPS UI
+
+    # ══════════════════════════════════════════════════
+    #  RESULT CONSUMER
+    # ══════════════════════════════════════════════════
+    def _start_result_consumer(self):
+        """Xử lý kết quả từ thread nhận diện."""
+        def consume():
+            while True:
+                try:
+                    result = self.result_queue.get_nowait()
+                    rtype = result.get("type")
+
+                    if rtype == "frame_result":
+                        self._last_recognition_results = result["results"]
+                        count = len(result["results"])
+                        if count > 0:
+                            self._set_status(
+                                f"👁 Đang nhận diện {count} khuôn mặt..."
+                            )
+
+                    elif rtype == "new_attendance":
+                        self._set_status(f"✅ {result['message']}")
+                        self._refresh_attendance_table()
+                        self._flash_success()
+
+                except queue.Empty:
+                    pass
+                time.sleep(0.1)
+
+        t = threading.Thread(target=consume, daemon=True)
+        t.start()
+
+    # ══════════════════════════════════════════════════
+    #  FACE DATA
+    # ══════════════════════════════════════════════════
+    def _load_face_data(self):
+        """Tải dữ liệu khuôn mặt (ưu tiên cache)."""
+        def _load():
+            self._set_status("⏳ Đang tải dữ liệu khuôn mặt...")
+            enc, names = load_encodings()
+            if not enc:
+                enc, names = load_known_faces()
+                if enc:
+                    save_encodings(enc, names)
+            self.known_encodings = enc
+            self.known_names = names
+            count = len(set(names))
+            self._update_db_count(count)
+            if count:
+                self._set_status(f"✅ Đã tải {count} người trong cơ sở dữ liệu")
+            else:
+                self._set_status(
+                    "⚠️ Chưa có dữ liệu khuôn mặt — Thêm ảnh vào thư mục known_faces/"
+                )
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _reload_faces(self):
+        """Tải lại dữ liệu khuôn mặt từ thư mục (bỏ qua cache)."""
+        def _reload():
+            self._set_status("🔄 Đang tải lại dữ liệu khuôn mặt...")
+            enc, names = load_known_faces()
+            if enc:
+                save_encodings(enc, names)
+            self.known_encodings = enc
+            self.known_names = names
+            count = len(set(names))
+            self._update_db_count(count)
+            self._set_status(f"✅ Đã tải lại: {count} người")
+            messagebox.showinfo("Thành công",
+                                f"Đã tải lại {count} người từ known_faces/")
+
+        threading.Thread(target=_reload, daemon=True).start()
+
+    # ══════════════════════════════════════════════════
+    #  ATTENDANCE TABLE
+    # ══════════════════════════════════════════════════
+    def _refresh_attendance_table(self):
+        """Cập nhật bảng điểm danh."""
+        records = self.attendance_mgr.get_today_attendance()
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        for i, r in enumerate(records):
+            tag = "even" if i % 2 == 0 else "odd"
+            self.tree.insert("", tk.END, values=(
+                r["stt"],
+                r["display_name"],
+                r["time"],
+                r["status"],
+            ), tags=(tag,))
+
+        total = len(records)
+        self.stat_total_label.config(text=str(total))
+
+        # Scroll xuống dòng mới nhất
+        children = self.tree.get_children()
+        if children:
+            self.tree.see(children[-1])
+
+    # ══════════════════════════════════════════════════
+    #  EXPORT
+    # ══════════════════════════════════════════════════
+    def _export_excel(self):
+        path = self.attendance_mgr.export_to_excel()
+        if path:
+            messagebox.showinfo("Xuất Excel thành công",
+                                f"File đã được lưu tại:\n{path}")
+            import subprocess
+            subprocess.Popen(["explorer", "/select,", path])
+        else:
+            messagebox.showwarning("Thông báo",
+                                   "Không có dữ liệu điểm danh hôm nay để xuất!")
+
+    def _open_attendance_folder(self):
+        import subprocess
+        subprocess.Popen(["explorer", config.ATTENDANCE_DIR])
+
+    # ══════════════════════════════════════════════════
+    #  UI HELPERS
+    # ══════════════════════════════════════════════════
+    def _make_button(self, parent, text, color, command, width=12):
+        btn = tk.Button(
+            parent, text=text, command=command,
+            bg=color, fg="white",
+            font=config.FONTS["body_bold"],
+            relief="flat", bd=0, cursor="hand2",
+            padx=12, pady=6, width=width,
+            activebackground=color, activeforeground="white"
+        )
+        btn.bind("<Enter>", lambda e: btn.config(bg=self._lighten(color)))
+        btn.bind("<Leave>", lambda e: btn.config(bg=color))
+        return btn
+
+    def _lighten(self, hex_color):
+        """Làm sáng màu hex một chút khi hover."""
+        try:
+            r = int(hex_color[1:3], 16)
+            g = int(hex_color[3:5], 16)
+            b = int(hex_color[5:7], 16)
+            r = min(255, r + 30)
+            g = min(255, g + 30)
+            b = min(255, b + 30)
+            return f"#{r:02x}{g:02x}{b:02x}"
+        except Exception:
+            return hex_color
+
+    def _add_card_border(self, widget):
+        widget.config(highlightbackground=config.COLORS["border"],
+                      highlightthickness=1)
+
+    def _set_status(self, msg):
+        self.root.after(0, lambda: self.status_label.config(text=msg))
+
+    def _update_datetime(self):
+        from datetime import datetime
+        now = datetime.now().strftime("%A, %d/%m/%Y  %H:%M:%S")
+        self.datetime_label.config(text=now)
+        self.root.after(1000, self._update_datetime)
+
+    def _update_db_count(self, count=None):
+        if count is None:
+            info = get_known_faces_info()
+            count = len(info)
+        self.root.after(0, lambda: self.stat_db_label.config(text=str(count)))
+
+    def _flash_success(self):
+        """Hiệu ứng flash xanh lá khi điểm danh thành công."""
+        original_bg = config.COLORS["bg_card"]
+        flash_bg = config.COLORS["success_bg"]
+
+        def _do_flash(times=3, on=True):
+            if times <= 0:
+                self.stat_total_label.config(bg=original_bg)
+                return
+            bg = flash_bg if on else original_bg
+            self.stat_total_label.config(bg=bg)
+            self.root.after(200, lambda: _do_flash(times - 1, not on))
+
+        _do_flash()
+
+    # ══════════════════════════════════════════════════
+    #  CLEANUP
+    # ══════════════════════════════════════════════════
+    def _on_close(self):
+        self.camera_running = False
+        if self.cap:
+            self.cap.release()
+        self.root.destroy()
