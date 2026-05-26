@@ -1,0 +1,151 @@
+"""
+face_encoder.py - Module mã hóa và quản lý khuôn mặt
+"""
+import os
+import pickle
+import face_recognition
+from PIL import Image
+import numpy as np
+import config
+
+
+def load_known_faces(known_faces_dir=None):
+    """
+    Quét thư mục known_faces/, trích xuất face encodings cho từng người.
+    Mỗi thư mục con = 1 người, tên thư mục = tên người đó.
+    
+    Returns:
+        tuple: (list of encodings, list of names)
+    """
+    if known_faces_dir is None:
+        known_faces_dir = config.KNOWN_FACES_DIR
+
+    known_encodings = []
+    known_names = []
+    supported_ext = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+    if not os.path.exists(known_faces_dir):
+        print(f"[WARN] Thư mục {known_faces_dir} không tồn tại.")
+        return [], []
+
+    person_dirs = [
+        d for d in os.listdir(known_faces_dir)
+        if os.path.isdir(os.path.join(known_faces_dir, d))
+    ]
+
+    if not person_dirs:
+        print("[WARN] Không tìm thấy dữ liệu khuôn mặt nào trong known_faces/")
+        return [], []
+
+    print(f"[INFO] Đang tải dữ liệu khuôn mặt của {len(person_dirs)} người...")
+
+    for person_name in person_dirs:
+        person_dir = os.path.join(known_faces_dir, person_name)
+        image_files = [
+            f for f in os.listdir(person_dir)
+            if os.path.splitext(f)[1].lower() in supported_ext
+        ]
+
+        if not image_files:
+            print(f"  [SKIP] {person_name}: Không có ảnh hợp lệ")
+            continue
+
+        encoded_count = 0
+        for img_file in image_files:
+            img_path = os.path.join(person_dir, img_file)
+            encoding = encode_face_from_image(img_path)
+            if encoding is not None:
+                known_encodings.append(encoding)
+                known_names.append(person_name)
+                encoded_count += 1
+
+        display_name = person_name.replace("_", " ").title()
+        print(f"  ✓ {display_name}: {encoded_count}/{len(image_files)} ảnh được mã hóa")
+
+    print(f"[INFO] Hoàn tất! Tổng cộng {len(known_encodings)} mẫu khuôn mặt.")
+    return known_encodings, known_names
+
+
+def encode_face_from_image(image_path):
+    """
+    Mã hóa khuôn mặt từ một file ảnh.
+    
+    Returns:
+        numpy array encoding hoặc None nếu không tìm thấy khuôn mặt
+    """
+    try:
+        image = face_recognition.load_image_file(image_path)
+        encodings = face_recognition.face_encodings(image)
+        if encodings:
+            return encodings[0]
+        else:
+            print(f"  [WARN] Không tìm thấy khuôn mặt trong: {os.path.basename(image_path)}")
+            return None
+    except Exception as e:
+        print(f"  [ERROR] Lỗi khi xử lý {image_path}: {e}")
+        return None
+
+
+def save_encodings(encodings, names, filepath=None):
+    """Lưu encodings vào file pickle để cache."""
+    if filepath is None:
+        filepath = config.ENCODINGS_FILE
+    data = {"encodings": encodings, "names": names}
+    with open(filepath, "wb") as f:
+        pickle.dump(data, f)
+    print(f"[INFO] Đã lưu encodings vào: {filepath}")
+
+
+def load_encodings(filepath=None):
+    """
+    Tải encodings từ file cache.
+    
+    Returns:
+        tuple: (encodings, names) hoặc ([], []) nếu file không tồn tại
+    """
+    if filepath is None:
+        filepath = config.ENCODINGS_FILE
+    if not os.path.exists(filepath):
+        return [], []
+    try:
+        with open(filepath, "rb") as f:
+            data = pickle.load(f)
+        encodings = data.get("encodings", [])
+        names = data.get("names", [])
+        print(f"[INFO] Đã tải {len(encodings)} encodings từ cache.")
+        return encodings, names
+    except Exception as e:
+        print(f"[ERROR] Lỗi khi tải cache encodings: {e}")
+        return [], []
+
+
+def get_known_faces_info(known_faces_dir=None):
+    """
+    Lấy thông tin danh sách người trong thư mục known_faces.
+    
+    Returns:
+        list of dict: [{"name": str, "photo_count": int, "display_name": str}]
+    """
+    if known_faces_dir is None:
+        known_faces_dir = config.KNOWN_FACES_DIR
+    
+    info = []
+    supported_ext = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    
+    if not os.path.exists(known_faces_dir):
+        return info
+
+    for person_name in os.listdir(known_faces_dir):
+        person_dir = os.path.join(known_faces_dir, person_name)
+        if not os.path.isdir(person_dir):
+            continue
+        photos = [
+            f for f in os.listdir(person_dir)
+            if os.path.splitext(f)[1].lower() in supported_ext
+        ]
+        info.append({
+            "name": person_name,
+            "display_name": person_name.replace("_", " ").title(),
+            "photo_count": len(photos),
+        })
+    return info
