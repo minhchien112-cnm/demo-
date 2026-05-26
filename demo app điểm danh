@@ -1,0 +1,441 @@
+import streamlit as st
+import cv2
+import face_recognition
+import numpy as np
+import pandas as pd
+import os
+import pickle
+from datetime import datetime, date
+from pathlib import Path
+import time
+
+# ──────────────── CONFIG ────────────────
+BASE_DIR        = Path(__file__).parent
+KNOWN_DIR       = BASE_DIR / "known_faces"
+DATA_DIR        = BASE_DIR / "attendance_data"
+ENCODINGS_FILE  = BASE_DIR / "encodings.pkl"
+CSV_FILE        = DATA_DIR / "attendance.csv"
+EXCEL_FILE      = DATA_DIR / "attendance.xlsx"
+
+KNOWN_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(exist_ok=True)
+
+st.set_page_config(
+    page_title="Hệ thống Điểm danh",
+    page_icon="👤",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ──────────────── CSS ────────────────
+st.markdown("""
+<style>
+[data-testid="stSidebar"] { background: #0f172a; }
+[data-testid="stSidebar"] * { color: #e2e8f0 !important; }
+[data-testid="stSidebar"] .stRadio label { color: #e2e8f0 !important; }
+.metric-card {
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 1.2rem 1.5rem;
+    text-align: center;
+    border: 1px solid #334155;
+}
+.metric-card .value { font-size: 2.2rem; font-weight: 700; color: #38bdf8; }
+.metric-card .label { font-size: 0.85rem; color: #94a3b8; margin-top: 4px; }
+.status-known  { background:#dcfce7; color:#166534; border-radius:6px; padding:2px 10px; font-size:13px; font-weight:600; }
+.status-unknown{ background:#fee2e2; color:#991b1b; border-radius:6px; padding:2px 10px; font-size:13px; font-weight:600; }
+.person-card {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin: 6px 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+div[data-testid="stVideo"] video { border-radius: 12px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ──────────────── HELPERS ────────────────
+def load_encodings():
+    if ENCODINGS_FILE.exists():
+        with open(ENCODINGS_FILE, "rb") as f:
+            return pickle.load(f)
+    return {"names": [], "encodings": []}
+
+def save_encodings(data):
+    with open(ENCODINGS_FILE, "wb") as f:
+        pickle.dump(data, f)
+
+def train_from_folder():
+    db = {"names": [], "encodings": []}
+    errors = []
+    count = 0
+    if not KNOWN_DIR.exists():
+        return db, errors, 0
+    for person_dir in sorted(KNOWN_DIR.iterdir()):
+        if not person_dir.is_dir():
+            continue
+        name = person_dir.name.replace("_", " ").title()
+        for img_path in person_dir.iterdir():
+            if img_path.suffix.lower() not in [".jpg", ".jpeg", ".png", ".webp"]:
+                continue
+            img = face_recognition.load_image_file(str(img_path))
+            encs = face_recognition.face_encodings(img)
+            if encs:
+                db["names"].append(name)
+                db["encodings"].append(encs[0])
+                count += 1
+            else:
+                errors.append(f"{img_path.name}: không phát hiện khuôn mặt")
+    save_encodings(db)
+    return db, errors, count
+
+def load_attendance():
+    if CSV_FILE.exists():
+        return pd.read_csv(CSV_FILE)
+    return pd.DataFrame(columns=["Tên", "Ngày", "Giờ điểm danh"])
+
+def save_attendance(df):
+    df.to_csv(CSV_FILE, index=False)
+    df.to_excel(EXCEL_FILE, index=False)
+
+def mark_attendance(name):
+    df = load_attendance()
+    today = str(date.today())
+    already = ((df["Tên"] == name) & (df["Ngày"] == today)).any()
+    if already:
+        return False, df
+    now = datetime.now().strftime("%H:%M:%S")
+    new_row = pd.DataFrame([{"Tên": name, "Ngày": today, "Giờ điểm danh": now}])
+    df = pd.concat([df, new_row], ignore_index=True)
+    save_attendance(df)
+    return True, df
+
+def recognize_frame(frame, db, tolerance=0.52):
+    small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+    rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+    locs  = face_recognition.face_locations(rgb, model="hog")
+    encs  = face_recognition.face_encodings(rgb, locs)
+    results = []
+    for enc, loc in zip(encs, locs):
+        name = "Unknown"
+        color = (239, 68, 68)
+        if db["encodings"]:
+            dists = face_recognition.face_distance(db["encodings"], enc)
+            idx   = int(np.argmin(dists))
+            if dists[idx] < tolerance:
+                name  = db["names"][idx]
+                color = (34, 197, 94)
+        top, right, bottom, left = [v * 2 for v in loc]
+        results.append({"name": name, "box": (top, right, bottom, left), "color": color})
+    return results
+
+def draw_results(frame, results):
+    for r in results:
+        top, right, bottom, left = r["box"]
+        c = r["color"]
+        cv2.rectangle(frame, (left, top), (right, bottom), c, 2)
+        cv2.rectangle(frame, (left, bottom - 30), (right, bottom), c, cv2.FILLED)
+        cv2.putText(frame, r["name"], (left + 6, bottom - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+    return frame
+
+# ──────────────── SIDEBAR ────────────────
+with st.sidebar:
+    st.markdown("## 👤 Điểm danh")
+    st.markdown("---")
+    page = st.radio("Chức năng", [
+        "🏠 Tổng quan",
+        "📸 Nhận diện Camera",
+        "🖼️ Nhận diện từ Ảnh",
+        "🗂️ Quản lý khuôn mặt",
+        "📊 Báo cáo điểm danh",
+    ])
+    st.markdown("---")
+    db = load_encodings()
+    n_persons = len(set(db["names"])) if db["names"] else 0
+    st.markdown(f"**Database:** {n_persons} người / {len(db['names'])} ảnh")
+    enc_ok = ENCODINGS_FILE.exists()
+    st.markdown(f"**Trạng thái:** {'✅ Sẵn sàng' if enc_ok and n_persons > 0 else '⚠️ Chưa train'}")
+
+# ══════════════════════════════════════════
+# PAGE: Tổng quan
+# ══════════════════════════════════════════
+if page == "🏠 Tổng quan":
+    st.title("🏠 Hệ thống Điểm danh Nhận diện Khuôn mặt")
+    st.markdown("Ứng dụng tự động nhận diện và ghi nhận điểm danh bằng AI.")
+
+    df = load_attendance()
+    today = str(date.today())
+    today_df = df[df["Ngày"] == today] if not df.empty else pd.DataFrame()
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(f"""<div class="metric-card">
+            <div class="value">{n_persons}</div>
+            <div class="label">Người trong database</div></div>""", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"""<div class="metric-card">
+            <div class="value">{len(today_df)}</div>
+            <div class="label">Điểm danh hôm nay</div></div>""", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"""<div class="metric-card">
+            <div class="value">{len(df)}</div>
+            <div class="label">Tổng lượt điểm danh</div></div>""", unsafe_allow_html=True)
+    with c4:
+        days = df["Ngày"].nunique() if not df.empty else 0
+        st.markdown(f"""<div class="metric-card">
+            <div class="value">{days}</div>
+            <div class="label">Ngày có dữ liệu</div></div>""", unsafe_allow_html=True)
+
+    st.markdown("---")
+    col_l, col_r = st.columns(2)
+
+    with col_l:
+        st.subheader("📋 Điểm danh hôm nay")
+        if today_df.empty:
+            st.info("Chưa có ai điểm danh hôm nay.")
+        else:
+            for _, row in today_df.iterrows():
+                st.markdown(f"""
+                <div class="person-card">
+                  <span style="font-size:1.5rem">👤</span>
+                  <div>
+                    <div style="font-weight:600;color:#e2e8f0">{row['Tên']}</div>
+                    <div style="font-size:12px;color:#64748b">{row['Giờ điểm danh']}</div>
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+    with col_r:
+        st.subheader("📌 Hướng dẫn nhanh")
+        st.markdown("""
+1. **Thêm khuôn mặt** → trang *Quản lý khuôn mặt*
+2. **Train model** → nhấn nút Train trong trang đó
+3. **Điểm danh** → trang *Nhận diện Camera* hoặc *Nhận diện từ Ảnh*
+4. **Xem báo cáo** → trang *Báo cáo điểm danh*
+        """)
+        if not enc_ok or n_persons == 0:
+            st.warning("⚠️ Bạn chưa có dữ liệu khuôn mặt. Hãy vào **Quản lý khuôn mặt** để bắt đầu!")
+
+# ══════════════════════════════════════════
+# PAGE: Nhận diện Camera
+# ══════════════════════════════════════════
+elif page == "📸 Nhận diện Camera":
+    st.title("📸 Nhận diện từ Camera")
+    db = load_encodings()
+
+    if not db["encodings"]:
+        st.error("⚠️ Chưa có dữ liệu khuôn mặt. Hãy vào **Quản lý khuôn mặt** và train trước.")
+        st.stop()
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.markdown("### 🎥 Camera trực tiếp")
+        run = st.toggle("Bật camera", value=False, key="cam_toggle")
+        frame_placeholder = st.empty()
+        info_placeholder  = st.empty()
+
+    with col2:
+        st.markdown("### 📝 Đã điểm danh")
+        log_placeholder = st.empty()
+        st.markdown("---")
+        tol = st.slider("Độ chính xác (tolerance)", 0.3, 0.7, 0.52, 0.01,
+                        help="Thấp hơn = chặt hơn. Khuyến nghị: 0.45–0.55")
+
+    if "attended_today" not in st.session_state:
+        st.session_state.attended_today = set()
+
+    if run:
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            st.error("Không thể mở camera. Kiểm tra lại thiết bị.")
+        else:
+            while st.session_state.get("cam_toggle", False):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                results = recognize_frame(frame, db, tolerance=tol)
+                annotated = draw_results(frame.copy(), results)
+                rgb_frame = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                frame_placeholder.image(rgb_frame, channels="RGB", use_container_width=True)
+
+                for r in results:
+                    if r["name"] != "Unknown":
+                        marked, _ = mark_attendance(r["name"])
+                        if marked:
+                            st.session_state.attended_today.add(r["name"])
+                            info_placeholder.success(f"✅ Đã điểm danh: **{r['name']}**")
+
+                names_list = "\n".join([f"- {n}" for n in sorted(st.session_state.attended_today)]) or "_Chưa có_"
+                log_placeholder.markdown(names_list)
+                time.sleep(0.05)
+            cap.release()
+    else:
+        frame_placeholder.markdown("""
+        <div style="background:#1e293b;border-radius:12px;padding:80px;text-align:center;color:#64748b;">
+            <div style="font-size:3rem">📷</div>
+            <div style="margin-top:8px">Bật toggle để mở camera</div>
+        </div>""", unsafe_allow_html=True)
+
+# ══════════════════════════════════════════
+# PAGE: Nhận diện từ Ảnh
+# ══════════════════════════════════════════
+elif page == "🖼️ Nhận diện từ Ảnh":
+    st.title("🖼️ Nhận diện từ Ảnh")
+    db = load_encodings()
+
+    if not db["encodings"]:
+        st.error("⚠️ Chưa có dữ liệu. Hãy vào **Quản lý khuôn mặt** và train trước.")
+        st.stop()
+
+    tol = st.slider("Tolerance", 0.3, 0.7, 0.52, 0.01)
+    uploaded = st.file_uploader("Tải ảnh lên (JPG / PNG)", type=["jpg","jpeg","png"])
+
+    if uploaded:
+        file_bytes = np.frombuffer(uploaded.read(), np.uint8)
+        frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+        with st.spinner("Đang phân tích..."):
+            results = recognize_frame(frame, db, tolerance=tol)
+            annotated = draw_results(frame.copy(), results)
+            rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            st.image(rgb, use_container_width=True)
+        with col2:
+            st.subheader(f"Tìm thấy {len(results)} khuôn mặt")
+            for r in results:
+                if r["name"] == "Unknown":
+                    st.markdown(f'<span class="status-unknown">Unknown</span>', unsafe_allow_html=True)
+                else:
+                    st.markdown(f'<span class="status-known">✓ {r["name"]}</span>', unsafe_allow_html=True)
+                    marked, _ = mark_attendance(r["name"])
+                    if marked:
+                        st.success(f"Đã ghi điểm danh: **{r['name']}**")
+                    else:
+                        st.info(f"{r['name']} đã điểm danh hôm nay rồi.")
+
+# ══════════════════════════════════════════
+# PAGE: Quản lý khuôn mặt
+# ══════════════════════════════════════════
+elif page == "🗂️ Quản lý khuôn mặt":
+    st.title("🗂️ Quản lý Khuôn mặt")
+
+    tab1, tab2, tab3 = st.tabs(["➕ Thêm người mới", "📂 Danh sách", "⚙️ Train model"])
+
+    # ── Tab 1: Thêm người ──
+    with tab1:
+        st.subheader("Thêm người mới vào database")
+        name_input = st.text_input("Tên người (không dấu, dùng gạch dưới, vd: nguyen_van_a)")
+        photos = st.file_uploader("Tải ảnh khuôn mặt (1–5 ảnh)", type=["jpg","jpeg","png"], accept_multiple_files=True)
+
+        if st.button("💾 Lưu", type="primary") and name_input and photos:
+            folder = KNOWN_DIR / name_input.strip().lower().replace(" ", "_")
+            folder.mkdir(exist_ok=True)
+            saved = 0
+            for photo in photos:
+                dest = folder / photo.name
+                with open(dest, "wb") as f:
+                    f.write(photo.getbuffer())
+                saved += 1
+            st.success(f"✅ Đã lưu {saved} ảnh cho **{name_input}** vào `known_faces/{name_input}/`")
+            st.info("⚠️ Nhớ vào tab **Train model** để cập nhật database sau khi thêm người mới!")
+
+    # ── Tab 2: Danh sách ──
+    with tab2:
+        st.subheader("Danh sách người trong database")
+        if not any(KNOWN_DIR.iterdir()) if KNOWN_DIR.exists() else True:
+            st.info("Chưa có dữ liệu khuôn mặt nào.")
+        else:
+            for person_dir in sorted(KNOWN_DIR.iterdir()):
+                if not person_dir.is_dir(): continue
+                imgs = [f for f in person_dir.iterdir() if f.suffix.lower() in [".jpg",".jpeg",".png",".webp"]]
+                name_display = person_dir.name.replace("_", " ").title()
+                col_a, col_b, col_c = st.columns([3, 1, 1])
+                with col_a:
+                    st.markdown(f"👤 **{name_display}**")
+                with col_b:
+                    st.markdown(f"{len(imgs)} ảnh")
+                with col_c:
+                    if st.button("🗑️", key=f"del_{person_dir.name}"):
+                        import shutil
+                        shutil.rmtree(person_dir)
+                        st.success(f"Đã xóa {name_display}")
+                        st.rerun()
+
+    # ── Tab 3: Train ──
+    with tab3:
+        st.subheader("Train / Cập nhật model nhận diện")
+        st.info("Chạy lại mỗi khi bạn thêm hoặc xóa người khỏi database.")
+        if st.button("🚀 Bắt đầu Train", type="primary"):
+            with st.spinner("Đang trích xuất face encodings..."):
+                db_new, errors, count = train_from_folder()
+            if count == 0:
+                st.error("Không tìm thấy khuôn mặt nào. Kiểm tra lại ảnh trong thư mục known_faces/")
+            else:
+                st.success(f"✅ Train xong! Đã mã hóa **{count} ảnh** / **{len(set(db_new['names']))} người**")
+            if errors:
+                with st.expander(f"⚠️ {len(errors)} ảnh bị lỗi"):
+                    for e in errors:
+                        st.write(f"- {e}")
+
+# ══════════════════════════════════════════
+# PAGE: Báo cáo
+# ══════════════════════════════════════════
+elif page == "📊 Báo cáo điểm danh":
+    st.title("📊 Báo cáo Điểm danh")
+    df = load_attendance()
+
+    if df.empty:
+        st.info("Chưa có dữ liệu điểm danh.")
+        st.stop()
+
+    # Filters
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        all_dates = sorted(df["Ngày"].unique(), reverse=True)
+        date_filter = st.selectbox("Lọc theo ngày", ["Tất cả"] + all_dates)
+    with col_f2:
+        all_names = sorted(df["Tên"].unique())
+        name_filter = st.selectbox("Lọc theo tên", ["Tất cả"] + all_names)
+
+    filtered = df.copy()
+    if date_filter != "Tất cả":
+        filtered = filtered[filtered["Ngày"] == date_filter]
+    if name_filter != "Tất cả":
+        filtered = filtered[filtered["Tên"] == name_filter]
+
+    # Metrics
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.markdown(f"""<div class="metric-card">
+            <div class="value">{len(filtered)}</div>
+            <div class="label">Lượt điểm danh</div></div>""", unsafe_allow_html=True)
+    with m2:
+        st.markdown(f"""<div class="metric-card">
+            <div class="value">{filtered['Tên'].nunique()}</div>
+            <div class="label">Người duy nhất</div></div>""", unsafe_allow_html=True)
+    with m3:
+        st.markdown(f"""<div class="metric-card">
+            <div class="value">{filtered['Ngày'].nunique()}</div>
+            <div class="label">Ngày</div></div>""", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.dataframe(filtered.sort_values("Ngày", ascending=False), use_container_width=True, hide_index=True)
+
+    # Downloads
+    col_d1, col_d2 = st.columns(2)
+    with col_d1:
+        csv_data = filtered.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("⬇️ Tải CSV", csv_data, "attendance.csv", "text/csv")
+    with col_d2:
+        import io
+        buf = io.BytesIO()
+        filtered.to_excel(buf, index=False, engine="openpyxl")
+        st.download_button("⬇️ Tải Excel", buf.getvalue(), "attendance.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
