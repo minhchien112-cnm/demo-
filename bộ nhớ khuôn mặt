@@ -1,0 +1,180 @@
+"""
+face_recognizer.py - Module nhận diện khuôn mặt thời gian thực
+"""
+import cv2
+import face_recognition
+import numpy as np
+import config
+
+
+def recognize_faces(frame, known_encodings, known_names):
+    """
+    Nhận diện khuôn mặt trong một frame từ camera.
+    
+    Args:
+        frame: Frame ảnh BGR từ OpenCV
+        known_encodings: Danh sách face encodings đã biết
+        known_names: Danh sách tên tương ứng
+    
+    Returns:
+        list of dict: [{"name": str, "location": tuple, "confidence": float}]
+    """
+    # Thu nhỏ frame để tăng tốc độ xử lý
+    scale = config.FRAME_SCALE
+    small_frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+    
+    # Chuyển BGR (OpenCV) → RGB (face_recognition)
+    rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+    
+    # Tìm vị trí khuôn mặt
+    face_locations = face_recognition.face_locations(
+        rgb_small, model=config.DETECTION_MODEL
+    )
+    
+    if not face_locations:
+        return []
+    
+    # Trích xuất encodings của các khuôn mặt tìm được
+    face_encodings = face_recognition.face_encodings(rgb_small, face_locations)
+    
+    results = []
+    for face_encoding, face_location in zip(face_encodings, face_locations):
+        name = "Unknown"
+        confidence = 0.0
+        
+        if known_encodings:
+            # So sánh với cơ sở dữ liệu
+            face_distances = face_recognition.face_distance(known_encodings, face_encoding)
+            best_match_idx = np.argmin(face_distances)
+            best_distance = face_distances[best_match_idx]
+            
+            if best_distance <= config.FACE_MATCH_TOLERANCE:
+                name = known_names[best_match_idx]
+                # Chuyển khoảng cách → độ tin cậy (%)
+                confidence = (1 - best_distance) * 100
+        
+        # Scale vị trí lại theo frame gốc
+        top, right, bottom, left = face_location
+        inv_scale = 1.0 / scale
+        scaled_location = (
+            int(top * inv_scale),
+            int(right * inv_scale),
+            int(bottom * inv_scale),
+            int(left * inv_scale),
+        )
+        
+        results.append({
+            "name": name,
+            "location": scaled_location,
+            "confidence": confidence,
+        })
+    
+    return results
+
+
+def draw_face_boxes(frame, recognition_results):
+    """
+    Vẽ bounding boxes và nhãn lên frame.
+    
+    Args:
+        frame: Frame gốc BGR
+        recognition_results: Kết quả từ recognize_faces()
+    
+    Returns:
+        frame đã được vẽ
+    """
+    output = frame.copy()
+    
+    for result in recognition_results:
+        name = result["name"]
+        top, right, bottom, left = result["location"]
+        confidence = result["confidence"]
+        is_known = name != "Unknown"
+        
+        # Màu sắc theo trạng thái nhận diện
+        color = config.BOX_COLOR_KNOWN if is_known else config.BOX_COLOR_UNKNOWN
+        
+        # === Vẽ bounding box với góc bo tròn ===
+        _draw_rounded_rect(output, (left, top), (right, bottom), color, radius=10)
+        
+        # === Chuẩn bị nhãn ===
+        display_name = name.replace("_", " ").title() if is_known else "Unknown"
+        if is_known and confidence > 0:
+            label = f"{display_name} ({confidence:.0f}%)"
+        else:
+            label = display_name
+        
+        # === Vẽ nền nhãn ===
+        label_size, baseline = cv2.getTextSize(
+            label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            config.LABEL_FONT_SCALE,
+            config.LABEL_THICKNESS
+        )
+        label_w, label_h = label_size
+        
+        # Nền nhãn phía trên box
+        label_bg_top = max(0, top - label_h - 12)
+        label_bg_bottom = top
+        label_bg_right = min(frame.shape[1], left + label_w + 10)
+        
+        # Vẽ nền bán trong suốt
+        overlay = output.copy()
+        cv2.rectangle(
+            overlay,
+            (left, label_bg_top),
+            (label_bg_right, label_bg_bottom),
+            color,
+            -1
+        )
+        cv2.addWeighted(overlay, 0.85, output, 0.15, 0, output)
+        
+        # === Vẽ chữ ===
+        cv2.putText(
+            output,
+            label,
+            (left + 5, top - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            config.LABEL_FONT_SCALE,
+            (255, 255, 255),
+            config.LABEL_THICKNESS,
+            cv2.LINE_AA
+        )
+    
+    return output
+
+
+def _draw_rounded_rect(img, pt1, pt2, color, radius=10, thickness=2):
+    """Vẽ hình chữ nhật với góc bo tròn."""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    r = radius
+    
+    # 4 cạnh thẳng
+    cv2.line(img, (x1 + r, y1), (x2 - r, y1), color, thickness)
+    cv2.line(img, (x1 + r, y2), (x2 - r, y2), color, thickness)
+    cv2.line(img, (x1, y1 + r), (x1, y2 - r), color, thickness)
+    cv2.line(img, (x2, y1 + r), (x2, y2 - r), color, thickness)
+    
+    # 4 góc cong
+    cv2.ellipse(img, (x1 + r, y1 + r), (r, r), 180, 0, 90, color, thickness)
+    cv2.ellipse(img, (x2 - r, y1 + r), (r, r), 270, 0, 90, color, thickness)
+    cv2.ellipse(img, (x1 + r, y2 - r), (r, r),  90, 0, 90, color, thickness)
+    cv2.ellipse(img, (x2 - r, y2 - r), (r, r),   0, 0, 90, color, thickness)
+
+
+def add_overlay_info(frame, fps=0, face_count=0):
+    """Thêm thông tin FPS và số khuôn mặt lên góc frame."""
+    h, w = frame.shape[:2]
+    
+    # Nền bán trong suốt góc trên trái
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (200, 60), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+    
+    cv2.putText(frame, f"FPS: {fps:.1f}", (10, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 150), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"Khuon mat: {face_count}", (10, 46),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 1, cv2.LINE_AA)
+    
+    return frame
